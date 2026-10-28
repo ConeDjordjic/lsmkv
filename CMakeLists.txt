@@ -13,9 +13,12 @@ if(CMAKE_BUILD_TYPE STREQUAL "Debug")
     add_link_options(-fsanitize=address,undefined)
 endif()
 
+add_library(rendi_core STATIC src/store.cpp src/sstable.cpp)
+target_include_directories(rendi_core PUBLIC src)
+
 add_executable(rendi src/main.cpp)
 
 enable_testing()
-add_executable(store_test tests/store_test.cpp src/store.cpp)
-target_include_directories(store_test PRIVATE src)
+add_executable(store_test tests/store_test.cpp)
+target_link_libraries(store_test PRIVATE rendi_core)
 add_test(NAME store_test COMMAND store_test)

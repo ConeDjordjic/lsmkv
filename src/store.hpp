@@ -1,20 +1,18 @@
 #pragma once
+#include "memtable.hpp"
+#include "sstable.hpp"
+
 #include <cstddef>
-#include <functional>
+#include <cstdint>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
-#include <unordered_map>
-
-// transparent hash so find() takes a string_view without allocating
-struct StringHash {
-    using is_transparent = void;
-    std::size_t operator()(std::string_view s) const { return std::hash<std::string_view>{}(s); }
-};
+#include <vector>
 
 class Store {
   public:
-    explicit Store(const char *path); // opens the log and replays it
+    explicit Store(const char *dir); // creates dir if needed
     ~Store();
     Store(const Store &) = delete;
     Store &operator=(const Store &) = delete;
@@ -24,6 +22,16 @@ class Store {
     std::optional<std::string> get(std::string_view key) const;
 
   private:
-    int fd_;
-    std::unordered_map<std::string, std::string, StringHash, std::equal_to<>> memtable_;
+    void load_tables();
+    void replay_wal();
+    void insert(std::string_view key, std::optional<std::string_view> value);
+    void flush();
+    std::string table_path(std::uint32_t id) const;
+
+    std::string dir_;
+    int wal_fd_ = -1;
+    Memtable memtable_;
+    std::size_t memtable_bytes_ = 0;
+    std::vector<std::unique_ptr<Table>> tables_; // newest first
+    std::uint32_t next_table_id_ = 1;
 };
