@@ -1,4 +1,4 @@
-#include "crc32.hpp"
+#include "crc32c.hpp"
 #include "store.hpp"
 
 // so asserts still run in release builds
@@ -43,7 +43,7 @@ static void test_put_writes_one_record() {
     body.append("\x01\x00\x00\x00", 4);
     body.append("a1");
 
-    std::uint32_t crc = crc32(body);
+    std::uint32_t crc = crc32c(body);
     std::string expected(4, '\0');
     std::memcpy(expected.data(), &crc, 4);
     expected += body;
@@ -275,6 +275,121 @@ static void test_leftover_tmp_is_removed() {
     fs::remove_all(dir);
 }
 
+static void test_bloom_filter() {
+    const char *path = "test_bloom.sst";
+    Memtable memtable;
+    for (int i = 0; i < 10000; i++) {
+        memtable.insert_or_assign(key_at(i), "v");
+    }
+    write_table(path, memtable);
+
+    Table table(path);
+    for (int i = 0; i < 10000; i++) {
+        assert(table.may_contain(key_at(i)));
+    }
+    int false_positives = 0;
+    for (int i = 0; i < 10000; i++) {
+        if (table.may_contain(std::format("missing{:05}", i))) {
+            false_positives++;
+        }
+    }
+    // should be around 1%
+    assert(false_positives < 200);
+
+    fs::remove(path);
+}
+
+static int count_tables(const char *dir) {
+    int n = 0;
+    for (const auto &entry : fs::directory_iterator(dir)) {
+        if (entry.path().extension() == ".sst") {
+            n++;
+        }
+    }
+    return n;
+}
+
+static void test_compaction() {
+    const char *dir = "test_compact";
+    fs::remove_all(dir);
+
+    // 17000 puts = 4 flushes, the 4th one compacts
+    {
+        Store store(dir);
+        for (int i = 0; i < 17000; i++) {
+            store.put(key_at(i), value_at(i));
+            if (i == 5000) {
+                store.remove(key_at(5)); // key 5 is in table 1 by now
+            }
+            if (i == 9000) {
+                store.put(key_at(6), "new");
+            }
+        }
+        assert(count_tables(dir) == 1);
+    }
+
+    // the compacted table is sorted and has no tombstones left
+    {
+        Table table((fs::path(dir) / "000005.sst").c_str());
+        assert(table.is_base());
+        int count = 0;
+        std::string last;
+        for (TableIterator it(table); it.valid(); it.next()) {
+            assert(it.entry().value);
+            assert(it.entry().key != key_at(5));
+            assert(count == 0 || it.entry().key > last);
+            last = it.entry().key;
+            count++;
+        }
+        assert(count > 16000);
+    }
+
+    {
+        Store store(dir);
+        assert(!store.get(key_at(5)));
+        assert(store.get(key_at(6)) == "new");
+        for (int i = 0; i < 17000; i++) {
+            if (i != 5 && i != 6) {
+                assert(store.get(key_at(i)) == value_at(i));
+            }
+        }
+    }
+
+    // fake leftover input from a crashed compaction
+    const char *old_dir = "test_compact_old";
+    fs::remove_all(old_dir);
+    {
+        Store store(old_dir);
+        for (int i = 0; i < 5000; i++) {
+            store.put(key_at(i), value_at(i));
+        }
+    }
+    fs::copy_file(fs::path(old_dir) / "000001.sst", fs::path(dir) / "000001.sst");
+    {
+        Store store(dir);
+        assert(!fs::exists(fs::path(dir) / "000001.sst"));
+        assert(!store.get(key_at(5)));
+        assert(store.get(key_at(6)) == "new");
+
+        // flush again so there's a table newer than the base
+        for (int i = 17000; i < 21500; i++) {
+            store.put(key_at(i), value_at(i));
+        }
+        assert(fs::exists(fs::path(dir) / "000006.sst"));
+    }
+    fs::copy_file(fs::path(old_dir) / "000001.sst", fs::path(dir) / "000001.sst");
+    {
+        Store store(dir);
+        assert(!fs::exists(fs::path(dir) / "000001.sst"));
+        assert(fs::exists(fs::path(dir) / "000005.sst"));
+        assert(fs::exists(fs::path(dir) / "000006.sst"));
+        assert(!store.get(key_at(5)));
+        assert(store.get(key_at(17000)) == value_at(17000));
+    }
+
+    fs::remove_all(old_dir);
+    fs::remove_all(dir);
+}
 
 int main() {
     test_put_writes_one_record();
@@ -287,5 +402,7 @@ int main() {
     test_tombstone_in_table_hides_older_value();
     test_crash_before_wal_truncate();
     test_leftover_tmp_is_removed();
+    test_bloom_filter();
+    test_compaction();
     std::println("all tests passed");
 }

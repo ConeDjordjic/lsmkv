@@ -1,5 +1,5 @@
 #include "store.hpp"
-#include "crc32.hpp"
+#include "crc32c.hpp"
 #include "io.hpp"
 
 #include <algorithm>
@@ -26,6 +26,7 @@ constexpr std::uint8_t type_delete = 2;
 constexpr std::size_t header_size = 13;
 
 constexpr std::size_t memtable_limit = 4 * 1024 * 1024;
+constexpr std::size_t compact_at_tables = 4;
 
 void write_record(int fd, std::uint8_t type, std::string_view key, std::string_view value) {
     // 0xFFFFFFFF is the tombstone marker in tables
@@ -44,7 +45,7 @@ void write_record(int fd, std::uint8_t type, std::string_view key, std::string_v
     buf.append(key);
     buf.append(value);
 
-    std::uint32_t crc = crc32(std::string_view(buf).substr(4));
+    std::uint32_t crc = crc32c(std::string_view(buf).substr(4));
     std::memcpy(buf.data(), &crc, sizeof crc);
 
     write_all(fd, buf);
@@ -113,7 +114,15 @@ void Store::load_tables() {
 
     std::sort(ids.begin(), ids.end(), std::greater<>());
     for (std::uint32_t id : ids) {
-        tables_.push_back(std::make_unique<Table>(table_path(id).c_str()));
+        std::string path = table_path(id);
+        if (!tables_.empty() && tables_.back()->is_base()) {
+            // compaction crashed before deleting its inputs
+            if (::unlink(path.c_str()) == -1) {
+                fail("unlink");
+            }
+            continue;
+        }
+        tables_.push_back(std::make_unique<Table>(path.c_str()));
     }
     if (!ids.empty()) {
         next_table_id_ = ids.front() + 1;
@@ -153,7 +162,7 @@ void Store::replay_wal() {
             break;
         }
         std::size_t record_size = header_size + key_len + value_len;
-        if (crc32(rest.substr(4, record_size - 4)) != crc) {
+        if (crc32c(rest.substr(4, record_size - 4)) != crc) {
             break;
         }
 
@@ -206,6 +215,64 @@ void Store::flush() {
     next_table_id_++;
     memtable_.clear();
     memtable_bytes_ = 0;
+
+    if (tables_.size() >= compact_at_tables) {
+        compact();
+    }
+}
+
+// TODO: merges everything at once and stalls the put that triggers it. needs levels
+void Store::compact() {
+    std::string path = table_path(next_table_id_);
+    std::string tmp = path + ".tmp";
+    {
+        std::vector<std::unique_ptr<TableIterator>> inputs;
+        for (const auto &table : tables_) {
+            inputs.push_back(std::make_unique<TableIterator>(*table));
+        }
+
+        TableWriter out(tmp.c_str());
+        std::string key;
+        for (;;) {
+            // inputs are newest first, first one wins ties
+            TableIterator *best = nullptr;
+            for (const auto &input : inputs) {
+                if (input->valid() && (!best || input->entry().key < best->entry().key)) {
+                    best = input.get();
+                }
+            }
+            if (!best) {
+                break;
+            }
+
+            // every table is an input, so tombstones can go
+            if (best->entry().value) {
+                out.add(best->entry().key, best->entry().value);
+            }
+
+            key = best->entry().key;
+            for (const auto &input : inputs) {
+                if (input->valid() && input->entry().key == key) {
+                    input->next();
+                }
+            }
+        }
+        out.finish(true);
+    }
+
+    if (::rename(tmp.c_str(), path.c_str()) == -1) {
+        fail("rename");
+    }
+    sync_dir(dir_);
+
+    for (const auto &table : tables_) {
+        if (::unlink(table->path().c_str()) == -1) {
+            fail("unlink");
+        }
+    }
+    tables_.clear();
+    tables_.push_back(std::make_unique<Table>(path.c_str()));
+    next_table_id_++;
 }
 
 std::string Store::table_path(std::uint32_t id) const { return std::format("{}/{:06}.sst", dir_, id); }

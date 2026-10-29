@@ -26,6 +26,7 @@ class Store {
     void replay_wal();
     void insert(std::string_view key, std::optional<std::string_view> value);
     void flush();
+    void compact();
     std::string table_path(std::uint32_t id) const;
 
     std::string dir_;
