@@ -22,7 +22,7 @@ namespace {
 
 constexpr std::size_t block_size = 4096;
 constexpr std::size_t footer_size = 32;
-constexpr std::uint32_t table_magic = 0x33646e72; // "rnd3"
+constexpr std::uint32_t table_magic = 0x336d736c; // "lsm3"
 constexpr std::uint32_t tombstone = 0xFFFFFFFF;   // value_len of a deleted key
 
 // ~1% false positives

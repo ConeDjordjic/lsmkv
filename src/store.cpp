@@ -38,7 +38,7 @@ constexpr std::uint64_t target_table_size = 2 * 1024 * 1024;
 constexpr std::size_t compaction_pace = 32;
 
 // manifest: [magic u32][count u32] then [id u32][level u32] per table, then [crc u32]
-constexpr std::uint32_t manifest_magic = 0x4d646e72; // "rndM"
+constexpr std::uint32_t manifest_magic = 0x4d6d736c; // "lsmM"
 
 void write_record(int fd, std::uint8_t type, std::string_view key, std::string_view value) {
     // 0xFFFFFFFF is the tombstone marker in tables
