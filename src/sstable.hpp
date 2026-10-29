@@ -20,8 +20,9 @@ class TableWriter {
 
     // nullopt = tombstone
     void add(std::string_view key, std::optional<std::string_view> value);
-    // tables older than a base table are garbage
-    void finish(bool base);
+    // also fsyncs
+    void finish();
+    std::uint64_t size() const { return offset_ + block_.size(); }
 
   private:
     void finish_block();
@@ -30,6 +31,8 @@ class TableWriter {
     std::uint64_t offset_ = 0;
     std::string block_;
     std::string first_key_;
+    std::string smallest_;
+    std::string largest_;
     std::string index_;
     std::vector<std::uint64_t> hashes_;
 };
@@ -45,7 +48,10 @@ class Table {
 
     Lookup get(std::string_view key, std::string &value) const;
     bool may_contain(std::string_view key) const;
-    bool is_base() const { return base_; }
+
+    const std::string &smallest() const { return smallest_; }
+    const std::string &largest() const { return largest_; }
+    std::uint64_t size() const { return size_; }
     const std::string &path() const { return path_; }
 
   private:
@@ -63,7 +69,9 @@ class Table {
 
     std::string path_;
     int fd_;
-    bool base_ = false;
+    std::uint64_t size_ = 0;
+    std::string smallest_;
+    std::string largest_;
     std::string filter_;
     std::vector<BlockHandle> index_;
 };

@@ -10,6 +10,8 @@
 #include <format>
 #include <fstream>
 #include <iterator>
+#include <map>
+#include <memory>
 #include <print>
 #include <string>
 
@@ -263,11 +265,11 @@ static void test_leftover_tmp_is_removed() {
     const char *dir = "test_tmp";
     fs::remove_all(dir);
     fs::create_directory(dir);
-    std::ofstream(fs::path(dir) / "000001.sst.tmp") << "half a table";
+    std::ofstream(fs::path(dir) / "MANIFEST.tmp") << "half a manifest";
 
     {
         Store store(dir);
-        assert(!fs::exists(fs::path(dir) / "000001.sst.tmp"));
+        assert(!fs::exists(fs::path(dir) / "MANIFEST.tmp"));
         store.put("a", "1");
         assert(store.get("a") == "1");
     }
@@ -309,85 +311,87 @@ static int count_tables(const char *dir) {
     return n;
 }
 
-static void test_compaction() {
-    const char *dir = "test_compact";
+static int total(const std::vector<std::size_t> &counts) {
+    std::size_t n = 0;
+    for (std::size_t c : counts) {
+        n += c;
+    }
+    return static_cast<int>(n);
+}
+
+// random ops checked against a std::map, reopening every 25k ops
+static void test_matches_model() {
+    const char *dir = "test_model";
     fs::remove_all(dir);
 
-    // 17000 puts = 4 flushes, the 4th one compacts
+    std::map<std::string, std::string> model;
+    std::uint64_t rng = 42;
+    auto next = [&] {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        return rng;
+    };
+
+    auto store = std::make_unique<Store>(dir);
+    for (int i = 0; i < 100000; i++) {
+        std::string key = std::format("key{:05}", next() % 60000);
+        std::uint64_t op = next() % 100;
+        if (op < 70) {
+            std::string value(200 + next() % 600, static_cast<char>('a' + i % 26));
+            store->put(key, value);
+            model[key] = value;
+        } else if (op < 85) {
+            store->remove(key);
+            model.erase(key);
+        } else {
+            auto it = model.find(key);
+            auto got = store->get(key);
+            assert(it == model.end() ? !got : got == it->second);
+        }
+        assert(store->level_counts()[0] < 12);
+        if (i % 25000 == 24999) {
+            store.reset();
+            store = std::make_unique<Store>(dir);
+        }
+    }
+
+    for (int k = 0; k < 60000; k++) {
+        std::string key = std::format("key{:05}", k);
+        auto it = model.find(key);
+        auto got = store->get(key);
+        assert(it == model.end() ? !got : got == it->second);
+    }
+    assert(store->level_counts()[2] > 0);
+
+    // reopen cleans up unfinished compaction output
+    store.reset();
+    store = std::make_unique<Store>(dir);
+    assert(count_tables(dir) == total(store->level_counts()));
+
+    store.reset();
+    fs::remove_all(dir);
+}
+
+static void test_orphan_table_is_removed() {
+    const char *dir = "test_orphan";
+    fs::remove_all(dir);
+
     {
         Store store(dir);
-        for (int i = 0; i < 17000; i++) {
-            store.put(key_at(i), value_at(i));
-            if (i == 5000) {
-                store.remove(key_at(5)); // key 5 is in table 1 by now
-            }
-            if (i == 9000) {
-                store.put(key_at(6), "new");
-            }
-        }
-        assert(count_tables(dir) == 1);
-    }
-
-    // the compacted table is sorted and has no tombstones left
-    {
-        Table table((fs::path(dir) / "000005.sst").c_str());
-        assert(table.is_base());
-        int count = 0;
-        std::string last;
-        for (TableIterator it(table); it.valid(); it.next()) {
-            assert(it.entry().value);
-            assert(it.entry().key != key_at(5));
-            assert(count == 0 || it.entry().key > last);
-            last = it.entry().key;
-            count++;
-        }
-        assert(count > 16000);
-    }
-
-    {
-        Store store(dir);
-        assert(!store.get(key_at(5)));
-        assert(store.get(key_at(6)) == "new");
-        for (int i = 0; i < 17000; i++) {
-            if (i != 5 && i != 6) {
-                assert(store.get(key_at(i)) == value_at(i));
-            }
-        }
-    }
-
-    // fake leftover input from a crashed compaction
-    const char *old_dir = "test_compact_old";
-    fs::remove_all(old_dir);
-    {
-        Store store(old_dir);
         for (int i = 0; i < 5000; i++) {
             store.put(key_at(i), value_at(i));
         }
     }
-    fs::copy_file(fs::path(old_dir) / "000001.sst", fs::path(dir) / "000001.sst");
+    // fake orphan from a crashed compaction
+    fs::copy_file(fs::path(dir) / "000001.sst", fs::path(dir) / "000099.sst");
     {
         Store store(dir);
-        assert(!fs::exists(fs::path(dir) / "000001.sst"));
-        assert(!store.get(key_at(5)));
-        assert(store.get(key_at(6)) == "new");
-
-        // flush again so there's a table newer than the base
-        for (int i = 17000; i < 21500; i++) {
-            store.put(key_at(i), value_at(i));
-        }
-        assert(fs::exists(fs::path(dir) / "000006.sst"));
-    }
-    fs::copy_file(fs::path(old_dir) / "000001.sst", fs::path(dir) / "000001.sst");
-    {
-        Store store(dir);
-        assert(!fs::exists(fs::path(dir) / "000001.sst"));
-        assert(fs::exists(fs::path(dir) / "000005.sst"));
-        assert(fs::exists(fs::path(dir) / "000006.sst"));
-        assert(!store.get(key_at(5)));
-        assert(store.get(key_at(17000)) == value_at(17000));
+        assert(!fs::exists(fs::path(dir) / "000099.sst"));
+        assert(fs::exists(fs::path(dir) / "000001.sst"));
+        assert(store.get(key_at(0)) == value_at(0));
     }
 
-    fs::remove_all(old_dir);
     fs::remove_all(dir);
 }
 
@@ -403,6 +407,7 @@ int main() {
     test_crash_before_wal_truncate();
     test_leftover_tmp_is_removed();
     test_bloom_filter();
-    test_compaction();
+    test_matches_model();
+    test_orphan_table_is_removed();
     std::println("all tests passed");
 }

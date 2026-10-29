@@ -14,16 +14,16 @@
 // entry:  [key_len u32][value_len u32][key][value]
 // filter: [k u8][bits]                            bloom filter over every key
 // index:  [key_len u32][first key][offset u64][size u64]...    size includes the crc
-// footer: [filter_offset u64][index_offset u64][flags u32][crc u32][magic u32]
-//         crc covers the filter, index and footer up to the crc
+// range:  [len u32][smallest key][len u32][largest key]
+// footer: [filter_offset u64][index_offset u64][range_offset u64][crc u32][magic u32]
+//         crc covers the filter, index, range and the footer up to the crc
 
 namespace {
 
 constexpr std::size_t block_size = 4096;
-constexpr std::size_t footer_size = 28;
-constexpr std::uint32_t table_magic = 0x32646e72; // "rnd2"
+constexpr std::size_t footer_size = 32;
+constexpr std::uint32_t table_magic = 0x33646e72; // "rnd3"
 constexpr std::uint32_t tombstone = 0xFFFFFFFF;   // value_len of a deleted key
-constexpr std::uint32_t flag_base = 1;
 
 // ~1% false positives
 constexpr std::size_t bloom_bits_per_key = 10;
@@ -99,6 +99,10 @@ void TableWriter::add(std::string_view key, std::optional<std::string_view> valu
     if (block_.empty()) {
         first_key_ = key;
     }
+    if (hashes_.empty()) {
+        smallest_ = key;
+    }
+    largest_ = key;
     append_u32(block_, static_cast<std::uint32_t>(key.size()));
     append_u32(block_, value ? static_cast<std::uint32_t>(value->size()) : tombstone);
     block_ += key;
@@ -124,7 +128,7 @@ void TableWriter::finish_block() {
     block_.clear();
 }
 
-void TableWriter::finish(bool base) {
+void TableWriter::finish() {
     if (!block_.empty()) {
         finish_block();
     }
@@ -133,9 +137,14 @@ void TableWriter::finish(bool base) {
     std::uint64_t filter_offset = offset_;
     std::uint64_t index_offset = offset_ + meta.size();
     meta += index_;
+    std::uint64_t range_offset = offset_ + meta.size();
+    append_u32(meta, static_cast<std::uint32_t>(smallest_.size()));
+    meta += smallest_;
+    append_u32(meta, static_cast<std::uint32_t>(largest_.size()));
+    meta += largest_;
     append_u64(meta, filter_offset);
     append_u64(meta, index_offset);
-    append_u32(meta, base ? flag_base : 0);
+    append_u64(meta, range_offset);
     append_u32(meta, crc32c(meta));
     append_u32(meta, table_magic);
 
@@ -162,7 +171,7 @@ void write_table(const char *path, const Memtable &memtable) {
             writer.add(entry->first, std::nullopt);
         }
     }
-    writer.finish(false);
+    writer.finish();
 }
 
 Table::Table(const char *path) : path_(path), fd_(::open(path, O_RDONLY)) {
@@ -182,10 +191,10 @@ Table::Table(const char *path) : path_(path), fd_(::open(path, O_RDONLY)) {
     std::string footer = pread_exact(fd_, footer_size, size - footer_size);
     std::uint64_t filter_offset = read_u64(footer.data());
     std::uint64_t index_offset = read_u64(footer.data() + 8);
-    std::uint32_t flags = read_u32(footer.data() + 16);
-    std::uint32_t meta_crc = read_u32(footer.data() + 20);
-    if (read_u32(footer.data() + 24) != table_magic || filter_offset > index_offset ||
-        index_offset > size - footer_size) {
+    std::uint64_t range_offset = read_u64(footer.data() + 16);
+    std::uint32_t meta_crc = read_u32(footer.data() + 24);
+    if (read_u32(footer.data() + 28) != table_magic || filter_offset > index_offset ||
+        index_offset > range_offset || range_offset > size - footer_size) {
         corrupt("bad footer");
     }
 
@@ -193,11 +202,26 @@ Table::Table(const char *path) : path_(path), fd_(::open(path, O_RDONLY)) {
     if (crc32c(std::string_view(meta).substr(0, meta.size() - 8)) != meta_crc) {
         corrupt("bad meta crc");
     }
-    base_ = (flags & flag_base) != 0;
+    size_ = size;
     filter_ = meta.substr(0, index_offset - filter_offset);
 
+    std::string_view range =
+        std::string_view(meta).substr(range_offset - filter_offset, size - footer_size - range_offset);
+    for (std::string *key : {&smallest_, &largest_}) {
+        if (range.size() < 4) {
+            corrupt("bad range");
+        }
+        std::uint32_t len = read_u32(range.data());
+        range.remove_prefix(4);
+        if (len > range.size()) {
+            corrupt("bad range");
+        }
+        *key = range.substr(0, len);
+        range.remove_prefix(len);
+    }
+
     std::string_view rest =
-        std::string_view(meta).substr(index_offset - filter_offset, size - footer_size - index_offset);
+        std::string_view(meta).substr(index_offset - filter_offset, range_offset - index_offset);
     while (!rest.empty()) {
         if (rest.size() < 4) {
             corrupt("bad index");
